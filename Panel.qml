@@ -69,7 +69,7 @@ Panel {
     if (!root.pairingTarget || !hostWidget) return
     var device = root.pairingTarget
     hostWidget.rpc("pair.accept",
-      { host: device.address, port: device.pair_port, code: root.codeInput },
+      { host: device.address, port: device.pair_port, id: device.id, code: root.codeInput },
       function(res) {
         if (res && res.ok) {
           root.pairingTarget = null
@@ -508,7 +508,8 @@ Panel {
               }
               Button {
                 Layout.alignment: Qt.AlignVCenter
-                text: "Pair"
+                text: modelData.pair_port > 0 ? "Pair" : "Start pairing"
+                enabled: modelData.pair_port > 0
                 bordered: true
                 foreground: root.fg
                 accent: root.accent

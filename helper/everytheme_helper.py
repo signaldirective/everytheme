@@ -811,12 +811,17 @@ class Daemon:
             entry = {"id": peer_id, "name": name, "addr": addr, "port": port,
                      "pair_port": pair_port, "last_seen": now()}
             self.discovered[peer_id] = entry
-            is_new = True
+        # The pairing port is only open during a short window and changes every
+        # time. Push state whenever anything the UI acts on changes, or the
+        # "Pair" button will connect to a stale (closed) port.
+        changed = is_new or (
+            entry.get("name"), entry.get("addr"), entry.get("port"), entry.get("pair_port")
+        ) != (name, addr, port, pair_port)
         entry.update({"name": name, "addr": addr, "port": port,
                       "pair_port": pair_port, "last_seen": now()})
         self.store.touch_endpoint(peer_id, [addr], port)
-        if is_new:
-            log(f"discovered {name} at {addr}:{port}")
+        if changed:
+            log(f"discovered {name} at {addr}:{port}" + (f" pairing={pair_port}" if pair_port else ""))
             self.push_state()
 
     async def peers_changed(self) -> None:
@@ -912,8 +917,20 @@ class Daemon:
             await self._pair_cancel()
             return {"ok": True}
         if cmd == "pair.accept":
-            host = str(args["host"]).strip()
-            port = int(args["port"])
+            host = str(args.get("host", "")).strip()
+            port = int(args.get("port", 0) or 0)
+            # A discovered peer's pairing port is short-lived and changes each
+            # window, so resolve it from the live table rather than trusting a
+            # value the UI may have cached.
+            peer_id = str(args.get("id", ""))
+            entry = self.discovered.get(peer_id) if peer_id else None
+            if entry is not None:
+                if not entry.get("pair_port"):
+                    raise ValueError("the other device isn't showing a pairing code right now")
+                host = entry["addr"]
+                port = int(entry["pair_port"])
+            if not host or not port:
+                raise ValueError("no pairing address — start 'Pair a new device' on the other side")
             try:
                 ipaddress.ip_address(host)
             except ValueError:
@@ -1115,9 +1132,18 @@ class Daemon:
             with contextlib.suppress(OSError):
                 self._discovery_transport.sendto(payload, (target, self.discovery_port))
 
+    def _expire_discovered(self) -> None:
+        stale = [pid for pid, entry in self.discovered.items()
+                 if entry["last_seen"] + PEER_TTL < now()]
+        if stale:
+            for pid in stale:
+                del self.discovered[pid]
+            self.push_state()
+
     async def _beacon_loop(self) -> None:
         while self._run:
             self._beacon_burst()
+            self._expire_discovered()
             await asyncio.sleep(BEACON_INTERVAL)
 
     # ---- startup --------------------------------------------------------- #
