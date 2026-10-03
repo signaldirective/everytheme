@@ -244,7 +244,7 @@ Panel {
                 visible: root.pairing !== null
                 text: root.pairing
                   ? ("Or on the other device choose \"Enter address manually\" and use\n"
-                     + "Address: " + (((root.identity.addresses || [])[0]) || "?")
+                     + "Address: " + ((root.identity.addresses || []).join(", ") || "?")
                      + "    Port: " + root.pairing.port
                      + "    Code: " + root.pairing.code)
                   : ""
