@@ -529,10 +529,11 @@ Panel {
           }
 
           // ---- actions + status ---------------------------------------- //
-          Row {
+          // Stacked, not a row: two labeled buttons overflow the card width.
+          Column {
             visible: !root.inFlow
             width: body.width
-            spacing: Style.spacing.lg
+            spacing: Style.spacing.sm
 
             Button {
               text: "Pair a new device"
