@@ -9,6 +9,7 @@ theme is never modified.
 
 Covers the full product path:
   * pair two devices with the one-time code
+  * pair via a manual host+port+token (the "paste link" path, no discovery)
   * propagate a theme push A -> B
   * per-device switch excludes B from the next push
   * re-enabling resumes propagation
@@ -159,12 +160,15 @@ async def run() -> list[tuple[str, bool, str]]:
 
         a = Device(root, "a", 45992)
         b = Device(root, "b", 46092)
+        c = Device(root, "c", 46192)
         a.start(bin_dir)
         b.start(bin_dir)
+        c.start(bin_dir)
         try:
-            check("both daemons started",
+            check("all daemons started",
                   await wait_for(lambda: a.sock.exists())
-                  and await wait_for(lambda: b.sock.exists()))
+                  and await wait_for(lambda: b.sock.exists())
+                  and await wait_for(lambda: c.sock.exists()))
 
             a_status = (await rpc(a.sock, "status")).get("data", {})
             b_status = (await rpc(b.sock, "status")).get("data", {})
@@ -204,6 +208,16 @@ async def run() -> list[tuple[str, bool, str]]:
             check("re-enabled device catches up",
                   await wait_for(lambda: b.current_theme() == "everforest"), b.current_theme())
 
+            # --- manual pairing path: host + port + token, no discovery -- #
+            pairing = (await rpc(a.sock, "pair.start")).get("data") or {}
+            manual = await rpc(c.sock, "pair.accept",
+                               {"host": "127.0.0.1", "port": pairing["port"],
+                                "token": pairing["token"]})
+            check("manual token pairing ok", manual.get("ok") is True, str(manual))
+            c_peers = (await rpc(c.sock, "status")).get("data", {}).get("peers", [])
+            check("manual pairing pinned", len(c_peers) == 1,
+                  f"c={len(c_peers)}")
+
             # --- production hook path: local change broadcasts ----------- #
             hook = a.hook_script()
             check("theme-set hook installed", hook.exists(), str(hook))
@@ -220,6 +234,7 @@ async def run() -> list[tuple[str, bool, str]]:
         finally:
             a.stop()
             b.stop()
+            c.stop()
     finally:
         if cleanup is not None:
             cleanup.cleanup()

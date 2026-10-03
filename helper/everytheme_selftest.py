@@ -61,7 +61,8 @@ async def run() -> list[tuple[str, bool, str]]:
         root = Path(tmp)
         a = Device(root, "a")
         b = Device(root, "b")
-        c = Device(root, "c")
+        c = Device(root, "c")  # stays unpinned, for the negative TLS test
+        d = Device(root, "d")  # pairs via the QR/token path
 
         # 1. Successful pairing with the correct one-time code.
         await pair(a, b, method="code")
@@ -89,7 +90,16 @@ async def run() -> list[tuple[str, bool, str]]:
               wrong_rejected and len(b.daemon.store.peers) == before,
               f"rejected={wrong_rejected} peers={len(b.daemon.store.peers)}")
 
-        # 3 + 4. Authenticated command channel and replay rejection.
+        # 3. QR/token pairing path (no typed code) — used by manual links.
+        pairing = await a.open_pairing()
+        try:
+            await H.run_pairing_client(d.daemon, HOST, pairing.port, "qr", pairing.token)
+        finally:
+            await a.close_pairing()
+        check("pair: qr token path", len(d.daemon.store.peers) == 1,
+              f"d={len(d.daemon.store.peers)}")
+
+        # 4 + 5. Authenticated command channel and replay rejection.
         a_ctx = H.server_context(a.daemon.identity, a.daemon.store_bundle, verify_peers=True)
         server = await asyncio.start_server(a.daemon._accept_command, host=HOST, port=0, ssl=a_ctx)
         port = server.sockets[0].getsockname()[1]

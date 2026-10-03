@@ -899,10 +899,15 @@ class Daemon:
             await self._pair_cancel()
             return {"ok": True}
         if cmd == "pair.accept":
-            host = str(args["host"])
+            host = str(args["host"]).strip()
             port = int(args["port"])
-            if not is_local_source(host):
-                raise ValueError("refusing to pair with a non-local address")
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass  # a hostname (e.g. a VPN's MagicDNS name); DNS decides
+            else:
+                if not is_local_source(host):
+                    raise ValueError("refusing to pair with a non-local address")
             if args.get("token"):
                 result = await run_pairing_client(self, host, port, "qr", str(args["token"]))
             else:

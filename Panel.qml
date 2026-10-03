@@ -33,6 +33,15 @@ Panel {
   property string codeInput: ""
   property string statusText: ""
 
+  // Manual pairing, for networks where UDP discovery does not reach (NAT,
+  // restrictive VPNs). Uses the same one-time code / token as the normal flow.
+  property bool manualOpen: false
+  property string manualHost: ""
+  property string manualPort: ""
+  property string manualCode: ""
+
+  readonly property bool inFlow: root.pairing !== null || root.pairingTarget !== null || root.manualOpen
+
   function open() { root.controller.show() }
   function close() { root.controller.hide() }
   function toggle() { if (root.opened) root.close(); else root.open() }
@@ -70,6 +79,62 @@ Panel {
         }
       })
   }
+  function beginManual() {
+    root.manualOpen = true
+    root.pairingTarget = null
+    root.manualHost = ""
+    root.manualPort = ""
+    root.manualCode = ""
+    root.statusText = ""
+    Qt.callLater(function() { manualHostField.forceActiveFocus() })
+  }
+  function cancelManual() {
+    root.manualOpen = false
+    root.manualHost = ""
+    root.manualPort = ""
+    root.manualCode = ""
+  }
+  function parsePairLink(text) {
+    var at = text.indexOf("?")
+    if (text.indexOf("everytheme://") !== 0 || at < 0) return null
+    var out = ({})
+    var parts = text.substring(at + 1).split("&")
+    for (var i = 0; i < parts.length; i++) {
+      var eq = parts[i].indexOf("=")
+      if (eq < 0) continue
+      out[decodeURIComponent(parts[i].substring(0, eq))] =
+        decodeURIComponent(parts[i].substring(eq + 1))
+    }
+    return out
+  }
+  function doManual() {
+    if (!hostWidget) return
+    var host = root.manualHost.trim()
+    var port = root.manualPort.trim()
+    var code = root.manualCode.trim()
+    var token = ""
+    var parsed = root.parsePairLink(host)
+    if (parsed) {
+      host = parsed.host || ""
+      port = parsed.port || ""
+      token = parsed.token || ""
+    }
+    if (host === "" || port === "" || (token === "" && code === "")) {
+      root.statusText = "Enter the other device's address, port, and code — or paste its pairing link."
+      return
+    }
+    var args = { host: host, port: parseInt(port) }
+    if (token !== "") args.token = token
+    else args.code = code
+    hostWidget.rpc("pair.accept", args, function(res) {
+      if (res && res.ok) {
+        root.manualOpen = false
+        root.statusText = "Paired with " + (res.data && res.data.peer ? res.data.peer.name : "device")
+      } else {
+        root.statusText = "Pairing failed: " + (res && res.error ? res.error : "unknown error")
+      }
+    })
+  }
   function removePeer(id) { if (hostWidget) hostWidget.rpc("peer.remove", { id: id }) }
   function setEnabled(id, value) { if (hostWidget) hostWidget.rpc("peer.enabled", { id: id, enabled: value }) }
   function shortId(peer) {
@@ -92,7 +157,8 @@ Panel {
     PanelKeyCatcher {
       id: keys
       anchors.fill: parent
-      blocked: codeField.activeFocus
+      blocked: codeField.activeFocus || manualHostField.activeFocus
+        || manualPortField.activeFocus || manualCodeField.activeFocus
 
       Flickable {
         id: scroll
@@ -175,12 +241,17 @@ Panel {
                 font.letterSpacing: 4
               }
               Text {
-                visible: root.pairing && root.pairing.qr
-                text: root.pairing ? "or scan: " + root.pairing.qr : ""
-                color: root.dim
+                visible: root.pairing !== null
+                text: root.pairing
+                  ? ("Or on the other device choose \"Enter address manually\" and use\n"
+                     + "Address: " + (((root.identity.addresses || [])[0]) || "?")
+                     + "    Port: " + root.pairing.port
+                     + "    Code: " + root.pairing.code)
+                  : ""
+                color: root.fg
                 font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                elide: Text.ElideMiddle
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
                 width: parent.width
               }
               Button {
@@ -253,9 +324,90 @@ Panel {
             }
           }
 
+          // ---- pairing: manual address entry --------------------------- //
+          BorderSurface {
+            visible: root.manualOpen
+            width: body.width
+            implicitHeight: manualCol.implicitHeight + Style.spacing.popupPadding * 2
+            color: Style.normalFillFor(root.fg, root.accent)
+            radius: Style.cornerRadius
+            borderSpec: Border.controlSpec("focus", root.fg, root.accent)
+
+            Column {
+              id: manualCol
+              anchors.left: parent.left
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              anchors.leftMargin: Style.spacing.popupPadding
+              anchors.rightMargin: Style.spacing.popupPadding
+              spacing: Style.spacing.sm
+
+              Text {
+                text: "Enter the other device's pairing address and code, or paste its everytheme:// link."
+                color: root.fg
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+                width: parent.width
+              }
+              TextField {
+                id: manualHostField
+                width: parent.width
+                placeholderText: "address or pairing link"
+                foreground: root.fg
+                accent: root.accent
+                font.family: root.fontFamily
+                onTextChanged: root.manualHost = text
+                onAccepted: root.doManual()
+              }
+              TextField {
+                id: manualPortField
+                width: parent.width
+                placeholderText: "pairing port"
+                foreground: root.fg
+                accent: root.accent
+                font.family: root.fontFamily
+                inputMethodHints: Qt.ImhDigitsOnly
+                onTextChanged: root.manualPort = text
+                onAccepted: root.doManual()
+              }
+              TextField {
+                id: manualCodeField
+                width: parent.width
+                placeholderText: "6-digit code"
+                foreground: root.fg
+                accent: root.accent
+                font.family: root.fontFamily
+                inputMethodHints: Qt.ImhDigitsOnly
+                onTextChanged: root.manualCode = text
+                onAccepted: root.doManual()
+              }
+              Row {
+                spacing: Style.spacing.lg
+                Button {
+                  text: "Pair"
+                  bordered: true
+                  selected: true
+                  foreground: root.fg
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.doManual()
+                }
+                Button {
+                  text: "Cancel"
+                  bordered: true
+                  foreground: root.fg
+                  accent: root.accent
+                  fontFamily: root.fontFamily
+                  onClicked: root.cancelManual()
+                }
+              }
+            }
+          }
+
           // ---- paired devices ------------------------------------------ //
           PanelSectionHeader {
-            visible: root.pairing === null && root.pairingTarget === null
+            visible: !root.inFlow
             width: body.width
             text: "SYNCED DEVICES"
             foreground: root.fg
@@ -263,7 +415,7 @@ Panel {
           }
 
           Repeater {
-            model: (root.pairing === null && root.pairingTarget === null) ? root.peers : []
+            model: (!root.inFlow) ? root.peers : []
             delegate: RowLayout {
               required property var modelData
               width: body.width
@@ -309,7 +461,7 @@ Panel {
           }
 
           Text {
-            visible: root.pairing === null && root.pairingTarget === null && root.peers.length === 0
+            visible: !root.inFlow && root.peers.length === 0
             width: body.width
             text: "No devices yet. Pair one below to sync themes across your machines."
             color: root.dim
@@ -320,7 +472,7 @@ Panel {
 
           // ---- discovered (untrusted) devices -------------------------- //
           PanelSectionHeader {
-            visible: root.pairing === null && root.pairingTarget === null
+            visible: !root.inFlow
             width: body.width
             text: "ON YOUR NETWORK"
             foreground: root.fg
@@ -328,7 +480,7 @@ Panel {
           }
 
           Repeater {
-            model: (root.pairing === null && root.pairingTarget === null) ? root.discovered : []
+            model: (!root.inFlow) ? root.discovered : []
             delegate: RowLayout {
               required property var modelData
               width: body.width
@@ -367,7 +519,7 @@ Panel {
           }
 
           Text {
-            visible: root.pairing === null && root.pairingTarget === null && root.discovered.length === 0
+            visible: !root.inFlow && root.discovered.length === 0
             width: body.width
             text: "Searching your network… open EveryTheme on another machine to start pairing."
             color: root.dim
@@ -378,7 +530,7 @@ Panel {
 
           // ---- actions + status ---------------------------------------- //
           Row {
-            visible: root.pairing === null && root.pairingTarget === null
+            visible: !root.inFlow
             width: body.width
             spacing: Style.spacing.lg
 
@@ -390,6 +542,14 @@ Panel {
               accent: root.accent
               fontFamily: root.fontFamily
               onClicked: root.startPairing()
+            }
+            Button {
+              text: "Enter address manually"
+              bordered: true
+              foreground: root.fg
+              accent: root.accent
+              fontFamily: root.fontFamily
+              onClicked: root.beginManual()
             }
           }
 
