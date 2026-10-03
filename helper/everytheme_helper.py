@@ -628,10 +628,16 @@ async def run_pairing_client(daemon: "Daemon", host: str, port: int,
     """Called on the device where the user entered/scanned the code."""
     ctx = client_context(daemon.identity, daemon.store_bundle, verify_server=False)
     nb = secrets.token_bytes(16)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host=host, port=port, ssl=ctx, server_hostname="everytheme"),
-        timeout=CONNECT_TIMEOUT,
-    )
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host=host, port=port, ssl=ctx, server_hostname="everytheme"),
+            timeout=CONNECT_TIMEOUT,
+        )
+    except (OSError, asyncio.TimeoutError) as exc:
+        reason = str(exc) or "timed out"
+        raise ValueError(
+            f"could not reach {host}:{port} ({reason}) — are both devices on the same network?"
+        ) from exc
     try:
         await send_json(writer, {
             "t": "pair.hello",
