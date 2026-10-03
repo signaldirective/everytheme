@@ -533,11 +533,15 @@ class PairingServer:
         self.expires = now() + PAIR_TTL
         self.attempts = 0
         self.port = 0
-        self._server: asyncio.AbstractServer | None = None
+        # One listener per bound address. All are kept referenced so none is
+        # garbage-collected, and all are closed when the window ends — a
+        # multi-homed host must be reachable on whichever address the other
+        # device can route to, and must not leave stale pairing ports open.
+        self._servers: list[asyncio.AbstractServer] = []
 
     @property
     def active(self) -> bool:
-        return self._server is not None and now() < self.expires
+        return bool(self._servers) and now() < self.expires
 
     async def start(self, hosts: list[str] | None = None) -> None:
         ctx = server_context(self.daemon.identity, self.daemon.store_bundle, verify_peers=False)
@@ -546,20 +550,23 @@ class PairingServer:
         # the rest so a single advertised port covers every interface.
         first = await asyncio.start_server(self._handle, host=addresses[0], port=0, ssl=ctx)
         self.port = first.sockets[0].getsockname()[1]
-        self._server = first
+        self._servers.append(first)
         for addr in addresses[1:]:
             try:
-                await asyncio.start_server(self._handle, host=addr, port=self.port, ssl=ctx)
+                self._servers.append(
+                    await asyncio.start_server(self._handle, host=addr, port=self.port, ssl=ctx))
             except OSError:
                 continue
-        log(f"pairing window open (port {self.port}, expires in {PAIR_TTL:.0f}s)")
+        log(f"pairing window open on {len(self._servers)} addresses (port {self.port}, "
+            f"expires in {PAIR_TTL:.0f}s)")
 
     async def close(self) -> None:
-        if self._server is not None:
-            self._server.close()
+        servers, self._servers = self._servers, []
+        for server in servers:
+            server.close()
+        for server in servers:
             with contextlib.suppress(Exception):
-                await self._server.wait_closed()
-        self._server = None
+                await server.wait_closed()
 
     def _select_secret(self, method: str) -> tuple[bytes, bool]:
         if method == "qr":
