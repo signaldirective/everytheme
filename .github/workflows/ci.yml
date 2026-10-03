@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate manifest JSON
+        run: |
+          python3 - <<'PY'
+          import json
+          m = json.load(open("manifest.json"))
+          assert m["schemaVersion"] == 1
+          for key in ("id", "name", "version", "kinds", "entryPoints"):
+              assert key in m, f"manifest missing {key}"
+          print("manifest OK:", m["id"])
+          PY
+
+      - name: Confirm every entry point exists
+        run: |
+          python3 - <<'PY'
+          import json, pathlib
+          m = json.load(open("manifest.json"))
+          for kind, rel in m["entryPoints"].items():
+              assert pathlib.Path(rel).is_file(), f"missing entry point: {rel}"
+          print("entry points OK")
+          PY
+
+      - name: Security self-test
+        run: python3 helper/everytheme_helper.py --state-dir /tmp/et selftest
+
+      - name: Two-device integration test (loopback)
+        run: python3 helper/test_integration.py

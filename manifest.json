@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.signaldirective.everytheme",
+  "name": "EveryTheme",
+  "version": "0.1.0",
+  "author": "signaldirective",
+  "license": "MIT",
+  "description": "Sync your Omarchy theme across your own devices on the same LAN or VPN. Devices pair with a one-time code and authenticate every change with pinned certificates.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "EveryTheme",
+    "description": "Sync themes across your paired devices",
+    "category": "Themes",
+    "aliases": [
+      "theme sync",
+      "devices",
+      "everytheme"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
