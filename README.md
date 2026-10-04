@@ -17,17 +17,7 @@ Devices must be reachable over your LAN or a VPN. EveryTheme deliberately does
 attacker who knows your WAN IP cannot add themselves as a device or push theme
 or wallpaper changes.
 
-```
-┌─ EveryTheme bar widget (QML) ─┐  Unix socket, JSON  ┌─ everytheme-helper ─┐
-│ icon · device menu · switches │ ◀─────────────────▶ │ discovery (UDP)     │
-└───────────────────────────────┘                     │ mutual TLS (1.3)    │
-                                                      │ paired Ed25519 IDs  │
-                                                      └─────────┬───────────┘
-                                                                │ omarchy theme set
-                                                      ┌─────────▼───────────┐
-                                                      │ theme-set hook       │
-                                                      └─────────────────────┘
-```
+![EveryTheme bar menu](preview.png)
 
 ---
 
