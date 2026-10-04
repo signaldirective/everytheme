@@ -6,9 +6,11 @@ beyond loopback:
 
 1. Two devices pair successfully with the correct code, pinning each other.
 2. A wrong pairing code is rejected and pins nothing.
-3. A paired peer can send an authenticated command.
-4. A replayed command is rejected.
-5. A device holding a valid-looking but unpinned certificate is rejected at
+3. A rogue server that echoes the client's proof back to it is rejected and
+   never pinned (the reflection attack the marketplace review flagged).
+4. A paired peer can send an authenticated command.
+5. A replayed command is rejected.
+6. A device holding a valid-looking but unpinned certificate is rejected at
    the mutual-TLS layer before any command is read.
 
 Run: python3 helper/everytheme_helper.py --state-dir /tmp/et-selftest selftest
@@ -18,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 import tempfile
 from pathlib import Path
 
@@ -49,6 +52,54 @@ async def pair(initiator: Device, acceptor: Device, *, method: str, secret: str 
                                    pairing.code if secret is None else secret)
     finally:
         await initiator.close_pairing()
+
+
+async def echo_attack(attacker: Device, victim: Device) -> bool:
+    """A rogue pairing server that reflects the client's own proof back at it.
+
+    Returns True only if the client was fooled into pinning the attacker. It
+    never knows the pairing code, so a correct handshake must reject it.
+    """
+    ctx = H.server_context(attacker.daemon.identity, attacker.daemon.store_bundle,
+                           verify_peers=False)
+
+    async def handle(reader, writer):
+        try:
+            hello_b = await H.recv_json(reader)
+            if hello_b.get("t") != "pair.hello":
+                return
+            na = secrets.token_bytes(16)
+            await H.send_json(writer, {
+                "t": "pair.hello",
+                "v": H.PROTOCOL_VERSION,
+                "id": attacker.daemon.identity.id,
+                "name": attacker.daemon.identity.name,
+                "nonce": H.b64e(na),
+                "cert": H.b64e(attacker.daemon.identity.der),
+                "port": attacker.daemon.port,
+            })
+            confirm = await H.recv_json(reader)
+            # Reflect the client's proof straight back as our "proof".
+            await H.send_json(writer, {"t": "pair.confirm", "mac": confirm.get("mac")})
+            await H.send_json(writer, {"t": "pair.done", "id": attacker.daemon.identity.id})
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                writer.close()
+                await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, host=HOST, port=0, ssl=ctx)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        await H.run_pairing_client(victim.daemon, HOST, port, "code", "424242")
+        return len(victim.daemon.store.peers) > 0, "completed"
+    except ValueError as exc:
+        return False, str(exc)
+    finally:
+        server.close()
+        with contextlib.suppress(Exception):
+            await server.wait_closed()
 
 
 async def run() -> list[tuple[str, bool, str]]:
@@ -99,7 +150,19 @@ async def run() -> list[tuple[str, bool, str]]:
         check("pair: qr token path", len(d.daemon.store.peers) == 1,
               f"d={len(d.daemon.store.peers)}")
 
-        # 4 + 5. Authenticated command channel and replay rejection.
+        # 4. Reflection attack: a rogue server that echoes the client's own
+        #    proof back must not be pinned. This is the flaw that the generic
+        #    "confirm == the MAC we sent" check allowed before role binding.
+        victim = Device(root, "e")
+        rogue = Device(root, "rogue")
+        fooled, reason = await echo_attack(rogue, victim)
+        check("pair: reflected server proof rejected", not fooled, reason)
+        check("pair: rejection is the server-proof step", "prove" in reason, reason)
+        check("pair: rogue certificate not pinned",
+              len(victim.daemon.store.peers) == 0,
+              f"peers={len(victim.daemon.store.peers)}")
+
+        # 5 + 6. Authenticated command channel and replay rejection.
         a_ctx = H.server_context(a.daemon.identity, a.daemon.store_bundle, verify_peers=True)
         server = await asyncio.start_server(a.daemon._accept_command, host=HOST, port=0, ssl=a_ctx)
         port = server.sockets[0].getsockname()[1]

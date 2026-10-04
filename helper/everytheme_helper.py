@@ -590,6 +590,19 @@ def pair_transcript(na: bytes, nb: bytes, der_a: bytes, der_b: bytes) -> bytes:
     return b"everytheme-pair-v1" + na + nb + der_a + der_b
 
 
+def pair_proof(key: bytes, role: str, transcript: bytes) -> bytes:
+    """Role-bound proof of knowledge of the pairing key.
+
+    The two sides must never prove themselves with the same value. If they did,
+    an unauthenticated server could simply echo the client's own proof back and
+    have its certificate pinned without knowing the code/token. Binding the role
+    ("client"/"server") into the MAC makes the server's proof one the client
+    never emits, so it cannot be reflected.
+    """
+    return hmac.new(key, b"everytheme-pair/" + role.encode() + b"\x00" + transcript,
+                    hashlib.sha256).digest()
+
+
 class PairingServer:
     """Runs on the device that displays the code (the initiator)."""
 
@@ -665,17 +678,18 @@ class PairingServer:
             })
             key = pair_key(secret, na + nb, strong)
             transcript = pair_transcript(na, nb, self.daemon.identity.der, der_b)
-            expected = hmac.new(key, transcript, hashlib.sha256).digest()
+            # Verify the client's role-bound proof.
+            client_proof = pair_proof(key, "client", transcript)
             confirm_b = await recv_json(reader)
             got = b64d(confirm_b.get("mac", ""))
-            if not hmac.compare_digest(expected, got):
+            if not hmac.compare_digest(client_proof, got):
                 self.attempts += 1
                 await send_json(writer, {"t": "pair.error", "reason": "bad-secret"})
                 log(f"pairing rejected (attempt {self.attempts}/{PAIR_MAX_ATTEMPTS})")
                 if self.attempts >= PAIR_MAX_ATTEMPTS:
                     await self.close()
                 return
-            # Success: pin the peer, tell the client, then close the window.
+            # Success: pin the peer, prove our own role to the client, then close.
             peername = writer.get_extra_info("peername")
             peer = self.daemon.store.add(
                 id_=hello_b.get("id", ""),
@@ -684,7 +698,8 @@ class PairingServer:
                 addresses=[peername[0]] if peername else [],
                 port=int(hello_b.get("port", TCP_PORT)),
             )
-            await send_json(writer, {"t": "pair.confirm", "mac": b64e(expected)})
+            server_proof = pair_proof(key, "server", transcript)
+            await send_json(writer, {"t": "pair.confirm", "mac": b64e(server_proof)})
             await self.daemon.peers_changed()
             await send_json(writer, {"t": "pair.done", "id": self.daemon.identity.id})
             log(f"paired with {peer['name']} ({peer['id']})")
@@ -733,15 +748,20 @@ async def run_pairing_client(daemon: "Daemon", host: str, port: int,
         strong = method == "qr"
         key = pair_key(secret.encode(), na + nb, strong)
         transcript = pair_transcript(na, nb, der_a, daemon.identity.der)
-        mac = hmac.new(key, transcript, hashlib.sha256).digest()
-        await send_json(writer, {"t": "pair.confirm", "mac": b64e(mac)})
+        # Prove we know the code as the client, then require a *different*,
+        # role-bound proof from the server before pinning anything. Comparing
+        # the server's reply against the value we just sent would let a rogue
+        # server reflect it and be trusted without knowing the code.
+        client_proof = pair_proof(key, "client", transcript)
+        await send_json(writer, {"t": "pair.confirm", "mac": b64e(client_proof)})
         reply = await recv_json(reader)
         if reply.get("t") == "pair.error":
             raise ValueError("wrong pairing code")
         if reply.get("t") != "pair.confirm":
             raise ValueError("unexpected pairing reply")
-        if not hmac.compare_digest(mac, b64d(reply["mac"])):
-            raise ValueError("pairing confirmation mismatch")
+        server_proof = pair_proof(key, "server", transcript)
+        if not hmac.compare_digest(server_proof, b64d(reply.get("mac", ""))):
+            raise ValueError("server failed to prove knowledge of the pairing code")
         done = await recv_json(reader)
         if done.get("t") != "pair.done":
             raise ValueError("pairing did not complete")
