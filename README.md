@@ -7,10 +7,15 @@ devices you have paired, flip a per-device switch to exclude one temporarily,
 and pair new machines. Change the theme on any paired machine and every other
 paired machine follows.
 
+EveryTheme also syncs wallpapers: pick a photo on one machine and the others
+follow. A background that belongs to the active theme is sent as a tiny
+reference (the receivers already have the file, because themes sync); a custom
+image is transferred over the authenticated channel, size-capped and validated.
+
 Devices must be reachable over your LAN or a VPN. EveryTheme deliberately does
 **not** expose anything to the internet and does not punch through NAT — an
 attacker who knows your WAN IP cannot add themselves as a device or push theme
-changes.
+or wallpaper changes.
 
 ```
 ┌─ EveryTheme bar widget (QML) ─┐  Unix socket, JSON  ┌─ everytheme-helper ─┐
@@ -45,11 +50,25 @@ both already present on Omarchy. No `pip install`, no sudo, no systemd unit.
 |---|---|
 | `BarWidget.qml` | Bar icon, spawns/supervises the helper, keeps a Unix-socket JSON-RPC connection, opens the menu |
 | `Panel.qml` | Device list, per-device switches, pairing UI |
-| `helper/everytheme_helper.py` | Device identity, LAN discovery, pairing handshake, authenticated command channel, applying and broadcasting themes |
+| `helper/everytheme_helper.py` | Device identity, LAN discovery, pairing handshake, authenticated command channel, applying and broadcasting themes and wallpapers |
 | theme-set hook | `~/.config/omarchy/hooks/theme-set.d/50-everytheme` — installed by the helper so *any* local theme change (keybind, CLI, another app) is broadcast |
+| background watcher | Polls `~/.local/state/omarchy/current/background` (Omarchy has no background hook) and broadcasts changes, with loop suppression |
 
 The helper listens on a private/LAN address and on a Unix socket, and speaks
 newline-delimited JSON with the UI.
+
+### Wallpaper sync
+
+- If the new background lives under the current theme's `backgrounds/`
+  directory, the helper sends `wallpaper.ref {theme, name}`; the receiver
+  resolves its own copy (themes are already in sync) and applies it. No image
+  bytes cross the network.
+- Otherwise (a custom image you picked), the helper sends `wallpaper.set`:
+  a JSON header followed by the raw bytes. The receiver enforces a 25 MB cap,
+  checks the image magic bytes, stores it under
+  `~/.config/omarchy/everytheme/wallpapers/`, and applies it.
+- Applying a wallpaper changes the same symlink the watcher observes, so a
+  suppression window prevents a received wallpaper from being re-broadcast.
 
 ---
 

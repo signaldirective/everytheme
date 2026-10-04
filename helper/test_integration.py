@@ -34,7 +34,7 @@ from pathlib import Path
 HELPER = Path(__file__).resolve().parent / "everytheme_helper.py"
 
 OMARCHY_STUB = """#!/bin/bash
-# Fake omarchy for tests: records calls and tracks the "current" theme.
+# Fake omarchy for tests: records calls and tracks "current" theme/background.
 echo "$*" >> "$HOME/omarchy-calls.log"
 case "$1 $2" in
   "theme set")
@@ -43,6 +43,20 @@ case "$1 $2" in
     ;;
   "theme current")
     cat "$HOME/.local/state/omarchy/current/theme.name" 2>/dev/null
+    ;;
+  "theme dir")
+    echo "$HOME/.config/omarchy/themes/$3"
+    ;;
+  "theme bg")
+    case "$3" in
+      set)
+        mkdir -p "$HOME/.local/state/omarchy/current"
+        ln -nsf "$(realpath "$4")" "$HOME/.local/state/omarchy/current/background"
+        ;;
+      current)
+        readlink -f "$HOME/.local/state/omarchy/current/background" 2>/dev/null
+        ;;
+    esac
     ;;
 esac
 exit 0
@@ -62,8 +76,10 @@ class Device:
         self.discovery = port + 1
         self.proc: subprocess.Popen | None = None
         self.log = open(root / f"{name}.daemon.log", "w")
+        self.bin_dir: Path | None = None
 
     def start(self, bin_dir: Path) -> None:
+        self.bin_dir = bin_dir
         env = dict(os.environ)
         env["HOME"] = str(self.home)
         env["PATH"] = f"{bin_dir}:{env['PATH']}"
@@ -93,6 +109,26 @@ class Device:
         path = self.home / ".local" / "state" / "omarchy" / "current" / "theme.name"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(theme)
+
+    def env(self) -> dict:
+        return {**os.environ, "HOME": str(self.home),
+                "PATH": f"{self.bin_dir}:{os.environ['PATH']}"}
+
+    def run_omarchy(self, *args: str) -> None:
+        subprocess.run([str(self.bin_dir / "omarchy"), *args], env=self.env(), check=False)
+
+    def set_background(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"test")
+        self.run_omarchy("theme", "bg", "set", str(path))
+
+    def background(self) -> str:
+        link = self.home / ".local" / "state" / "omarchy" / "current" / "background"
+        try:
+            return os.path.realpath(link)
+        except OSError:
+            return ""
 
     def omarchy_calls(self) -> list[str]:
         path = self.home / "omarchy-calls.log"
@@ -227,6 +263,29 @@ async def run() -> list[tuple[str, bool, str]]:
                 "PATH": f"{bin_dir}:{os.environ['PATH']}"})
             check("hook broadcast reaches B",
                   await wait_for(lambda: b.current_theme() == "nord"), b.current_theme())
+
+            # --- custom wallpaper transfer A -> B ------------------------ #
+            custom = a.home / "Pictures" / "custom.png"
+            custom.parent.mkdir(parents=True, exist_ok=True)
+            custom.write_bytes(b"\x89PNG\r\n\x1a\n" + b"everytheme" * 64)
+            a.set_background(custom)
+            check("custom wallpaper transferred to B",
+                  await wait_for(lambda: "wallpapers" in b.background(), timeout=15),
+                  b.background())
+
+            # --- theme-background reference (no bytes on the wire) ------- #
+            slug = a.current_theme()
+            a_bg = (a.home / ".local" / "state" / "omarchy" / "current" / "theme"
+                    / "backgrounds" / "bg1.png")
+            a_bg.parent.mkdir(parents=True, exist_ok=True)
+            a_bg.write_bytes(b"\x89PNG\r\n\x1a\n" + b"theme-bg")
+            b_bg = b.home / ".config" / "omarchy" / "themes" / slug / "backgrounds" / "bg1.png"
+            b_bg.parent.mkdir(parents=True, exist_ok=True)
+            b_bg.write_bytes(b"\x89PNG\r\n\x1a\n" + b"theme-bg")
+            a.set_background(a_bg)
+            check("theme wallpaper reference applied on B",
+                  await wait_for(lambda: b.background() == str(b_bg), timeout=15),
+                  b.background())
 
             # --- no self-echo: A only set gruvbox once -------------------- #
             a_sets = [call for call in a.omarchy_calls() if call == "theme set gruvbox"]

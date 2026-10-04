@@ -77,7 +77,38 @@ TS_WINDOW = 300.0          # accept commands whose timestamp is within +/- 5 min
 APPLY_SUPPRESS = 90.0      # ignore our own theme hook for this long after a remote apply
 CONNECT_TIMEOUT = 5.0
 DEFAULT_STATE_DIR = Path.home() / ".config" / "omarchy" / "everytheme"
-ALLOWED_COMMANDS = {"theme.set", "ping"}
+ALLOWED_COMMANDS = {"theme.set", "ping", "wallpaper.ref", "wallpaper.set"}
+
+# Wallpaper sync: a receiver must never be able to make us buffer an unbounded
+# file, so the transfer is size-capped and only known image formats are kept.
+WALLPAPER_MAX_BYTES = 25 * 1024 * 1024
+WALLPAPER_POLL = 2.0
+WALLPAPER_SUPPRESS = 30.0
+IMAGE_MAGIC = (
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+)
+
+
+def detect_image_ext(data: bytes) -> str | None:
+    for magic, ext in IMAGE_MAGIC:
+        if data.startswith(magic):
+            return ext
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def current_background_path() -> str:
+    link = Path.home() / ".local" / "state" / "omarchy" / "current" / "background"
+    try:
+        resolved = os.path.realpath(link)
+        return resolved if os.path.isfile(resolved) else ""
+    except OSError:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -465,6 +496,42 @@ class ThemeManager:
             log(f"failed to apply theme {theme!r}: {exc}")
             return False
 
+    # ---- wallpaper ------------------------------------------------------ #
+    def current_theme_backgrounds(self) -> Path:
+        return Path.home() / ".local" / "state" / "omarchy" / "current" / "theme" / "backgrounds"
+
+    def theme_dir(self, slug: str) -> Path | None:
+        try:
+            out = subprocess.check_output([omarchy_bin(), "theme", "dir", slug], text=True,
+                                          stderr=subprocess.DEVNULL, timeout=10).strip()
+            if out and Path(out).is_dir():
+                return Path(out)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return None
+
+    def set_background(self, path: str) -> bool:
+        try:
+            subprocess.run([omarchy_bin(), "theme", "bg", "set", path], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            return True
+        except (subprocess.SubprocessError, OSError) as exc:
+            log(f"failed to set background {path!r}: {exc}")
+            return False
+
+    def resolve_theme_background(self, slug: str, name: str) -> str:
+        """Find a theme background on this device, preferring the live theme."""
+        if name != os.path.basename(name):
+            return ""  # reject any path component
+        candidates = [self.current_theme_backgrounds() / name]
+        theme_dir = self.theme_dir(slug) if slug else None
+        if theme_dir:
+            candidates.append(theme_dir / "backgrounds" / name)
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return ""
+
 
 # --------------------------------------------------------------------------- #
 # discovery
@@ -703,8 +770,8 @@ async def send_json(writer: asyncio.StreamWriter, obj: dict) -> None:
     await writer.drain()
 
 
-async def recv_json(reader: asyncio.StreamReader) -> dict:
-    line = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=15.0)
+async def recv_json(reader: asyncio.StreamReader, timeout: float = 15.0) -> dict:
+    line = await asyncio.wait_for(reader.readuntil(b"\n"), timeout=timeout)
     return json.loads(line.decode())
 
 
@@ -749,6 +816,10 @@ class Daemon:
         self._beacon_task: asyncio.Task | None = None
         self._suppress_theme = ""
         self._suppress_until = 0.0
+        self._wallpaper_task: asyncio.Task | None = None
+        self._wallpaper_sig: tuple = ()
+        self._wallpaper_suppress_path = ""
+        self._wallpaper_suppress_until = 0.0
         self._run = True
 
     def bind_addresses(self) -> list[str]:
@@ -1012,7 +1083,17 @@ class Daemon:
                 log(f"rejected command from non-local source {peername[0]}")
                 return
             msg = await recv_json(reader)
-            result = self._handle_message(peer, msg)
+            blob = None
+            if msg.get("type") == "wallpaper.set":
+                # Read the declared number of bytes *after* the header, with a
+                # hard cap so a trusted-but-hostile peer cannot make us buffer
+                # an unbounded payload.
+                size = int((msg.get("payload") or {}).get("size", 0) or 0)
+                if size < 1 or size > WALLPAPER_MAX_BYTES:
+                    await send_json(writer, {"ok": False, "error": "wallpaper-size"})
+                    return
+                blob = await asyncio.wait_for(reader.readexactly(size), timeout=60.0)
+            result = self._handle_message(peer, msg, blob)
             await send_json(writer, {"ok": result[0], "error": result[1]})
         except (asyncio.IncompleteReadError, ConnectionError, ValueError, KeyError) as exc:
             log(f"command error: {exc!r}")
@@ -1021,7 +1102,7 @@ class Daemon:
                 writer.close()
                 await writer.wait_closed()
 
-    def _handle_message(self, peer: dict, msg: dict) -> tuple[bool, str]:
+    def _handle_message(self, peer: dict, msg: dict, blob: bytes | None = None) -> tuple[bool, str]:
         if msg.get("to") != self.identity.id:
             return False, "not-addressed-to-me"
         if msg.get("from") != peer["id"]:
@@ -1047,9 +1128,47 @@ class Daemon:
             self.themes.apply(theme)
             self.push_state()
             log(f"applied remote theme {theme!r} from {peer['name']}")
+        elif mtype == "wallpaper.ref":
+            payload = msg.get("payload") or {}
+            slug = str(payload.get("theme", ""))
+            name = str(payload.get("name", ""))
+            path = self.themes.resolve_theme_background(slug, name)
+            if not path:
+                return False, "background-not-found"
+            self._apply_remote_wallpaper(path)
+            log(f"applied remote theme wallpaper {slug}/{name} from {peer['name']}")
+        elif mtype == "wallpaper.set":
+            if not blob:
+                return False, "missing-image"
+            path = self._store_wallpaper(blob)
+            if not path:
+                return False, "not-an-image"
+            self._apply_remote_wallpaper(path)
+            log(f"applied remote wallpaper from {peer['name']}")
         peer["last_seq"] = seq
         self.store.save()
         return True, ""
+
+    def _apply_remote_wallpaper(self, path: str) -> None:
+        # Applying changes the background symlink, which our watcher would
+        # otherwise re-broadcast as if the user had picked it locally.
+        self._wallpaper_suppress_path = os.path.realpath(path)
+        self._wallpaper_suppress_until = now() + WALLPAPER_SUPPRESS
+        self.themes.set_background(path)
+        self._wallpaper_sig = self._wallpaper_signature()
+        self.push_state()
+
+    def _store_wallpaper(self, blob: bytes) -> str:
+        ext = detect_image_ext(blob)
+        if ext is None:
+            return ""
+        digest = hashlib.sha256(blob).hexdigest()[:32]
+        directory = self.state_dir / "wallpapers"
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = directory / f"{digest}{ext}"
+        if not target.exists():
+            atomic_write(target, blob, 0o644)
+        return str(target)
 
     async def _broadcast_theme(self, theme: str) -> None:
         targets = [p for p in self.store.peers.values() if p.get("enabled", True)]
@@ -1057,10 +1176,11 @@ class Daemon:
                              return_exceptions=True)
         self.push_state()
 
-    async def _send_theme(self, peer: dict, theme: str) -> None:
+    async def _send_command(self, peer: dict, mtype: str, payload: dict,
+                            blob: bytes | None = None) -> bool:
         addresses = self._peer_addresses(peer)
         if not addresses:
-            return
+            return False
         ctx = client_context(self.identity, self.store_bundle, verify_server=True)
         peer["out_seq"] = int(peer.get("out_seq", 0)) + 1
         msg = {
@@ -1069,8 +1189,8 @@ class Daemon:
             "to": peer["id"],
             "seq": peer["out_seq"],
             "ts": now(),
-            "type": "theme.set",
-            "payload": {"theme": theme},
+            "type": mtype,
+            "payload": payload,
         }
         # A peer may be mid-restart or rebuilding its listener; retry briefly.
         for attempt in range(3):
@@ -1082,19 +1202,99 @@ class Daemon:
                                                 ssl=ctx, server_hostname="everytheme"),
                         timeout=CONNECT_TIMEOUT)
                     await send_json(writer, msg)
-                    reply = await recv_json(reader)
+                    if blob is not None:
+                        writer.write(blob)
+                        await writer.drain()
+                    reply = await recv_json(reader, timeout=30.0)
                     writer.close()
                     with contextlib.suppress(Exception):
                         await writer.wait_closed()
                     if reply.get("ok"):
                         self.store.save()
-                        log(f"pushed theme {theme!r} to {peer['name']} ({host})")
-                        return
+                        log(f"pushed {mtype} to {peer['name']} ({host})")
+                        return True
                 except (OSError, asyncio.TimeoutError, ConnectionError, ValueError):
                     continue
             if attempt < 2:
                 await asyncio.sleep(0.4)
-        log(f"could not reach peer {peer['name']}")
+        log(f"could not reach peer {peer['name']} for {mtype}")
+        return False
+
+    async def _send_theme(self, peer: dict, theme: str) -> None:
+        await self._send_command(peer, "theme.set", {"theme": theme})
+
+    def _wallpaper_reference(self) -> dict | None:
+        """A lightweight reference when the background belongs to the theme."""
+        path = current_background_path()
+        if not path:
+            return None
+        slug = self.themes.current()
+        try:
+            inside = os.path.commonpath([path, str(self.themes.current_theme_backgrounds())])
+        except ValueError:
+            return None
+        if inside != str(self.themes.current_theme_backgrounds()):
+            return None
+        return {"theme": slug, "name": os.path.basename(path)}
+
+    async def _broadcast_wallpaper(self) -> None:
+        targets = [p for p in self.store.peers.values() if p.get("enabled", True)]
+        await asyncio.gather(*(self._send_wallpaper(p) for p in targets),
+                             return_exceptions=True)
+        self.push_state()
+
+    async def _send_wallpaper(self, peer: dict) -> None:
+        ref = self._wallpaper_reference()
+        if ref is not None:
+            await self._send_command(peer, "wallpaper.ref", ref)
+            return
+        path = current_background_path()
+        if not path:
+            return
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            return
+        if len(data) > WALLPAPER_MAX_BYTES:
+            log(f"wallpaper too large to sync ({len(data)} bytes)")
+            return
+        if detect_image_ext(data) is None:
+            log(f"not a known image type, skipping {path!r}")
+            return
+        await self._send_command(peer, "wallpaper.set",
+                                 {"size": len(data), "name": os.path.basename(path)},
+                                 blob=data)
+
+    # ---- local wallpaper watcher ---------------------------------------- #
+    def _wallpaper_signature(self) -> tuple:
+        path = current_background_path()
+        if not path:
+            return ()
+        try:
+            st = os.stat(path)
+            return (path, st.st_size, int(st.st_mtime))
+        except OSError:
+            return ()
+
+    def _wallpaper_suppressed(self) -> bool:
+        if now() >= self._wallpaper_suppress_until:
+            return False
+        return current_background_path() == self._wallpaper_suppress_path
+
+    async def _wallpaper_loop(self) -> None:
+        self._wallpaper_sig = self._wallpaper_signature()
+        while self._run:
+            await asyncio.sleep(WALLPAPER_POLL)
+            sig = self._wallpaper_signature()
+            if sig == self._wallpaper_sig:
+                continue
+            self._wallpaper_sig = sig
+            if not sig:
+                continue
+            if self._wallpaper_suppressed():
+                self._wallpaper_suppress_until = 0.0
+                continue
+            asyncio.create_task(self._broadcast_wallpaper())
 
     def _peer_addresses(self, peer: dict) -> list[str]:
         addresses: list[str] = []
@@ -1171,6 +1371,7 @@ class Daemon:
         if self.install_hook:
             self.install_theme_hook()
         self._beacon_task = asyncio.create_task(self._beacon_loop())
+        self._wallpaper_task = asyncio.create_task(self._wallpaper_loop())
         self._beacon_burst()
         log(f"everytheme daemon up as {self.identity.name} ({self.identity.id})")
 
@@ -1178,6 +1379,8 @@ class Daemon:
         self._run = False
         if self._beacon_task:
             self._beacon_task.cancel()
+        if self._wallpaper_task:
+            self._wallpaper_task.cancel()
         await self._pair_cancel()
         if self._unix_server:
             self._unix_server.close()

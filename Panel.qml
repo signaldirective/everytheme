@@ -574,8 +574,8 @@ Panel {
           Text {
             width: body.width
             text: root.currentTheme !== ""
-              ? ("Current theme: " + root.currentTheme + " — change it anywhere and EveryTheme mirrors it.")
-              : "EveryTheme mirrors your theme changes to synced devices."
+              ? ("Current theme: " + root.currentTheme + " — themes and wallpapers mirror to synced devices.")
+              : "EveryTheme mirrors theme and wallpaper changes to synced devices."
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
